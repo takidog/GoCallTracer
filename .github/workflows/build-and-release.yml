@@ -1,0 +1,184 @@
+name: Build and Release
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: false
+        default: 'manual'
+  
+  # Tag trigger (v1.0.0, v2.1.3, etc.)
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  GO_VERSION: '1.21'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # x86_64 builds
+          - goos: linux
+            goarch: amd64
+            platform: linux-x86_64
+          - goos: windows
+            goarch: amd64
+            platform: windows-x86_64
+            extension: .exe
+          
+          # ARM builds (macOS)
+          - goos: darwin
+            goarch: arm64
+            platform: macos-arm64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Get dependencies
+      run: go mod download
+
+    - name: Build CLI
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: 0
+      run: |
+        mkdir -p dist
+        go build -ldflags="-s -w" -o dist/gct-cli-${{ matrix.platform }}${{ matrix.extension }} cmd/gct-cli/main.go
+
+    - name: Build Server
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: 0
+      run: |
+        go build -ldflags="-s -w" -o dist/gct-server-${{ matrix.platform }}${{ matrix.extension }} cmd/gct-server/main.go
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: binaries-${{ matrix.platform }}
+        path: dist/*
+        retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+        merge-multiple: true
+
+    - name: Organize artifacts
+      run: |
+        mkdir -p release
+        # Move all binaries to release folder
+        find dist -name "gct-*" -type f -exec cp {} release/ \;
+        ls -la release/
+
+    - name: Get version
+      id: get_version
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "${{ github.event.inputs.version }}" != "manual" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag_name=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            VERSION="manual-$(date +%Y%m%d-%H%M%S)"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "tag_name=${VERSION}" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          echo "tag_name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create checksums
+      run: |
+        cd release
+        sha256sum * > checksums.sha256
+        cat checksums.sha256
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.get_version.outputs.tag_name }}
+        name: GoCallTracer ${{ steps.get_version.outputs.version }}
+        body: |
+          ## GoCallTracer ${{ steps.get_version.outputs.version }}
+          
+          ### 📦 Available Downloads
+          
+          **CLI Tool:**
+          - `gct-cli-linux-x86_64` - Linux x86_64
+          - `gct-cli-windows-x86_64.exe` - Windows x86_64  
+          - `gct-cli-macos-arm64` - macOS ARM64 (Apple Silicon)
+          
+          **MCP Server:**
+          - `gct-server-linux-x86_64` - Linux x86_64
+          - `gct-server-windows-x86_64.exe` - Windows x86_64
+          - `gct-server-macos-arm64` - macOS ARM64 (Apple Silicon)
+          
+          ### 🚀 Quick Start
+          
+          **CLI Usage:**
+          ```bash
+          # Download and make executable
+          chmod +x gct-cli-*
+          
+          # Analyze a function
+          ./gct-cli-* -p /path/to/project -i internal/handler.go -t HandleRequest -deep 2
+          ```
+          
+          **MCP Server Usage:**
+          ```bash  
+          # Download and make executable
+          chmod +x gct-server-*
+          
+          # Run MCP server
+          ./gct-server-* -mode stdio
+          ```
+          
+          ### ✅ Checksums
+          SHA256 checksums are available in `checksums.sha256`
+          
+          ---
+          
+          Built from commit: ${{ github.sha }}
+        files: |
+          release/*
+        draft: false
+        prerelease: ${{ contains(steps.get_version.outputs.version, 'alpha') || contains(steps.get_version.outputs.version, 'beta') || contains(steps.get_version.outputs.version, 'rc') || github.event_name == 'workflow_dispatch' }}
+        generate_release_notes: false
